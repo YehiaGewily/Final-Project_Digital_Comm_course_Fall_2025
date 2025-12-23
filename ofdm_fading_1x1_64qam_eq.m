@@ -24,41 +24,74 @@ pilotSym = (1+1i)/sqrt(2);  % unit-energy
 h = (randn(1,L) + 1i*randn(1,L)) / sqrt(2*L);
 BER = zeros(size(EbNo_dB));
 
-%% Main simulation (Logic matches QPSK EQ base)
+%% Main simulation (Integrated with (7,4) Channel Coding)
 for e = 1:length(EbNo_dB)
     EbNoLin = 10^(EbNo_dB(e)/10);
     totalErr = 0; totalBits = 0;
+    
     for run = 1:numRuns
+        %% ---------- TRANSMITTER ----------
         X = zeros(N, numSymRun);
-        X(:,1) = pilotSym;  
-        numDataBits = N * k0 * numDataSym;
-        txBits = randi([0 1], numDataBits, 1);
-        dataSyms = qam_gray_mod(txBits, M);               
+        X(:,1) = pilotSym;  % Insert pilot symbol in the first column [cite: 104-106]
+        
+        % 1. Calculate RAW bit requirements (4/7 code rate)
+        nCodedBitsNeeded = N * k0 * numDataSym;
+        numRawBits = floor(nCodedBitsNeeded * (4/7));
+        txDataBits = randi([0 1], numRawBits, 1); % Your original information
+
+        % 2. ENCODE (Channel Coding) [cite: 82, 99]
+        txCodedBits = encode74(txDataBits); 
+
+        % 3. Map bits to symbols and pack the grid [cite: 102]
+        dataSyms = qam_gray_mod(txCodedBits, M);               
         X(:,2:end) = reshape(dataSyms, N, numDataSym);
+        
+        % 4. OFDM Modulation (IFFT) and Cyclic Prefix [cite: 93, 95, 119-121]
         x_time = ifft(X, N, 1);
         x_cp = [x_time(end-cp_len+1:end, :); x_time];
         tx_serial = x_cp(:);
+
+        %% ---------- CHANNEL SIMULATION ----------
+        % Calculate Noise and Apply Fading [cite: 133-137]
         SNRlin = EbNoLin * k0 * (N / (N + cp_len));
         Ps = mean(abs(tx_serial).^2);
         sigma2 = Ps / SNRlin;
+        
         tx_blocks = reshape(tx_serial, N+cp_len, numSymRun);
         rx_blocks = zeros(size(tx_blocks));
         for s = 1:numSymRun
             rx_blocks(:,s) = conv(tx_blocks(:,s), h, 'same');
         end
+        
         rx_faded = rx_blocks(:);
         noise = sqrt(sigma2/2) * (randn(size(rx_faded)) + 1i*randn(size(rx_faded)));
         rx_serial = rx_faded + noise;
+
+        %% ---------- RECEIVER ----------
+        % 1. CP Removal and FFT [cite: 122-123]
         rx_parallel = reshape(rx_serial, N+cp_len, numSymRun);
         rx_no_cp = rx_parallel(cp_len+1:end, :);       
         Yf = fft(rx_no_cp, N, 1);                          
+        
+        % 2. Channel Estimation and Equalization [cite: 104, 107]
         Hest = Yf(:,1) ./ X(:,1);
         Hest(abs(Hest) < 1e-12) = 1e-12;                   
         Yeq = Yf(:,2:end) ./ Hest;                         
+        
+        % 3. Demapping (Symbols -> Coded Bits)
         rxSyms = Yeq(:);
-        rxBits = qam_gray_demod(rxSyms, M);
-        err = sum(txBits ~= rxBits);
-        totalErr = totalErr + err; totalBits = totalBits + length(txBits);
+        rxCodedBits = qam_gray_demod(rxSyms, M);
+
+        % 4. DECODE (Channel Decoding) [cite: 101]
+        rxDecodedBits = decode74(rxCodedBits); 
+
+        %% ---------- BIT ERROR RATE (BER) ----------
+        % Compare decoded data back to original source bits [cite: 23-24]
+        nCompare = min(length(txDataBits), length(rxDecodedBits));
+        err = sum(txDataBits(1:nCompare) ~= rxDecodedBits(1:nCompare));
+        
+        totalErr = totalErr + err; 
+        totalBits = totalBits + nCompare;
     end
     BER(e) = totalErr / totalBits;
     fprintf('Eb/N0 = %2d dB, BER = %.3e\n', EbNo_dB(e), BER(e));

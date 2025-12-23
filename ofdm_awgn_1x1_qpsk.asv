@@ -1,0 +1,313 @@
+%% OFDM Project - Final Simulation (12 curves)
+% 3 modulations (QPSK, 16QAM, 64QAM)
+% 2 setups (1x1 SISO, 1x2 SIMO with MRC)
+% 2 channels (AWGN, multipath fading fixed realization)
+%
+% Pilot scheme: 1st OFDM symbol is ALL pilots (known), rest are data.
+% Channel estimation: H_est[k] = Ypilot[k] / Xpilot[k]
+% Equalization: ZF (divide by H_est)
+%
+% Matches project parameters (Table 1) and requirements.  :contentReference[oaicite:1]{index=1}
+
+clear; clc; close all;
+rng(1);
+
+%% Parameters (from document)
+N          = 1024;          % FFT size
+L          = 50;            % multipath taps
+cp_len     = 72;            % CP length (>= L-1 recommended)
+EbNo_dB    = 0:3:40;        % Eb/N0 sweep (dB)
+numRuns    = 1000;          % runs per Eb/N0
+numSymRun  = 100;           % OFDM symbols per run (total)
+numDataSym = numSymRun - 1; % data OFDM symbols per run (1 pilot + rest data)
+
+mods = [4, 16, 64];         % QPSK=4, 16QAM, 64QAM
+mimoSetups = ["SISO_1x1", "SIMO_1x2"];
+chanModels = ["AWGN", "FADING_FIXED"];
+
+% Pilot symbol (constant on all subcarriers in pilot OFDM symbol)
+pilotSym = (1+1i)/sqrt(2);  % unit energy
+
+% Pre-allocate results: BER(modIdx, mimoIdx, chanIdx, EbNoIdx)
+BER = zeros(length(mods), length(mimoSetups), length(chanModels), length(EbNo_dB));
+
+%% Fixed fading channel realization (deterministic for the whole simulation)
+% SISO: one h; SIMO: two independent h1,h2
+h_siso = gen_fading_channel(L);
+h_simo1 = gen_fading_channel(L);
+h_simo2 = gen_fading_channel(L);
+
+%% Main loops
+for mi = 1:length(mods)
+    M  = mods(mi);
+    k0 = log2(M); % bits per QAM symbol
+
+    for mimoIdx = 1:length(mimoSetups)
+        setup = mimoSetups(mimoIdx);
+
+        for ci = 1:length(chanModels)
+            chan = chanModels(ci);
+
+            fprintf("Running: M=%d, %s, %s\n", M, setup, chan);
+
+            for e = 1:length(EbNo_dB)
+                EbNoLin = 10^(EbNo_dB(e)/10);
+
+                totalErr = 0;
+                totalBits = 0;
+
+                for run = 1:numRuns
+
+                    %% ---------- TRANSMITTER ----------
+                    % Build frequency-domain grid: N x numSymRun
+                    % Symbol 1: pilots, Symbols 2..end: data
+                    X = zeros(N, numSymRun);
+                    X(:,1) = pilotSym;
+
+                    % Data bits for ALL data subcarriers across data OFDM symbols
+                    nDataQamSyms = N * numDataSym;
+                    txBits = randi([0 1], nDataQamSyms * k0, 1);
+                    % 4. ADD CHANNEL CODING HERE
+                    % OLD: txCodedBits = txDataBits; 
+                    txCodedBits = encode74(txDataBits);
+
+                    % Map to unit-average-energy QAM symbols (Gray)
+                    dataSyms = qam_gray_mod(txBits, M);      % column vector length nDataQamSyms
+                    X(:,2:end) = reshape(dataSyms, N, numDataSym);
+
+                    % OFDM modulation (IFFT) and CP
+                    x_time = ifft(X, N, 1);                  % N x numSymRun
+                    x_cp   = [x_time(end-cp_len+1:end, :); x_time]; % (N+cp) x numSymRun
+                    txSerial = x_cp(:);                      % serialize
+
+                    %% ---------- CHANNEL ----------
+                    % Eb/N0 -> SNR per time-domain sample, include CP overhead and k0 bits/sym
+                    % SNR_lin = EbNo_lin * k0 * (N/(N+cp))
+                    SNRlin = EbNoLin * k0 * (N/(N + cp_len));
+
+                    % Signal power
+                    Ps = mean(abs(txSerial).^2);
+                    sigma2 = Ps / SNRlin; % noise variance per complex sample
+
+                    if chan == "AWGN"
+                        if setup == "SISO_1x1"
+                            y1 = txSerial + sqrt(sigma2/2)*(randn(size(txSerial)) + 1i*randn(size(txSerial)));
+                        else
+                            % Two receive antennas, independent noise
+                            y1 = txSerial + sqrt(sigma2/2)*(randn(size(txSerial)) + 1i*randn(size(txSerial)));
+                            y2 = txSerial + sqrt(sigma2/2)*(randn(size(txSerial)) + 1i*randn(size(txSerial)));
+                        end
+
+                    else % FADING_FIXED
+                        if setup == "SISO_1x1"
+                            y1 = filter(h_siso, 1, txSerial);
+                            y1 = y1 + sqrt(sigma2/2)*(randn(size(y1)) + 1i*randn(size(y1)));
+                        else
+                            y1 = filter(h_simo1, 1, txSerial);
+                            y2 = filter(h_simo2, 1, txSerial);
+                            y1 = y1 + sqrt(sigma2/2)*(randn(size(y1)) + 1i*randn(size(y1)));
+                            y2 = y2 + sqrt(sigma2/2)*(randn(size(y2)) + 1i*randn(size(y2)));
+                        end
+                    end
+
+                    %% ---------- RECEIVER ----------
+                    % Reshape into OFDM symbols, remove CP, FFT
+                    if setup == "SISO_1x1"
+                        Y1 = reshape(y1(1:(N+cp_len)*numSymRun), N+cp_len, numSymRun);
+                        Y1 = Y1(cp_len+1:end, :);
+                        Y1f = fft(Y1, N, 1); % N x numSymRun
+
+                        % Channel estimation from pilot OFDM symbol
+                        Hest = Y1f(:,1) ./ X(:,1);
+
+                        % Equalize data symbols
+                        Yeq = Y1f(:,2:end) ./ Hest;
+
+                    else % SIMO 1x2
+                        Y1 = reshape(y1(1:(N+cp_len)*numSymRun), N+cp_len, numSymRun);
+                        Y2 = reshape(y2(1:(N+cp_len)*numSymRun), N+cp_len, numSymRun);
+                        Y1 = Y1(cp_len+1:end, :);
+                        Y2 = Y2(cp_len+1:end, :);
+
+                        Y1f = fft(Y1, N, 1);
+                        Y2f = fft(Y2, N, 1);
+
+                        % Channel estimates per antenna from pilot
+                        H1 = Y1f(:,1) ./ X(:,1);
+                        H2 = Y2f(:,1) ./ X(:,1);
+
+                        % MRC combining on data symbols (frequency domain)
+                        % Y_mrc = (conj(H1).*Y1 + conj(H2).*Y2) / (|H1|^2+|H2|^2)
+                        denom = (abs(H1).^2 + abs(H2).^2);
+                        denom(denom < 1e-12) = 1e-12; % safety
+
+                        Ydata1 = Y1f(:,2:end);
+                        Ydata2 = Y2f(:,2:end);
+
+                        Yeq = (conj(H1).*Ydata1 + conj(H2).*Ydata2) ./ denom;
+                    end
+
+                    % Serialize equalized QAM symbols
+                    rxSyms = Yeq(:);
+
+                    % Demap QAM -> bits
+                    rxBits = qam_gray_demod(rxSyms, M);
+
+                    % BER count
+                    nCompare = min(length(txBits), length(rxBits));
+                    err = sum(txBits(1:nCompare) ~= rxBits(1:nCompare));
+                    totalErr = totalErr + err;
+                    totalBits = totalBits + nCompare;
+                end
+
+                BER(mi, mimoIdx, ci, e) = totalErr / totalBits;
+            end
+        end
+    end
+end
+
+%% Plot results (12 curves)
+figure;
+leg = strings(0);
+hold on; grid on;
+
+markers = ["-o","-s","-^","-d","-*","-x","-+","-v","-p","-h","-<","->"];
+
+idx = 1;
+for mi = 1:length(mods)
+    for mimoIdx = 1:length(mimoSetups)
+        for ci = 1:length(chanModels)
+            semilogy(EbNo_dB, squeeze(BER(mi,mimoIdx,ci,:)), markers(idx), 'LineWidth', 1.5);
+            leg(end+1) = sprintf("M=%d, %s, %s", mods(mi), mimoSetups(mimoIdx), chanModels(ci));
+            idx = idx + 1;
+        end
+    end
+end
+
+xlabel('E_b/N_0 (dB)');
+ylabel('BER');
+title('OFDM BER Curves (QPSK/16QAM/64QAM) - SISO & SIMO - AWGN & Fixed Fading');
+legend(leg, 'Location','southwest');
+ylim([1e-5 1]);
+
+%% -------------------- Helper Functions --------------------
+function h = gen_fading_channel(L)
+    % Complex Gaussian taps with variance 1, normalized by sqrt(2L) as in the doc
+    h = (randn(1,L) + 1i*randn(1,L)) / sqrt(2*L);
+end
+
+function syms = qam_gray_mod(bits, M)
+    % Square QAM Gray mapping, unit average energy
+    % bits: column vector of 0/1, length multiple of log2(M)
+    k = log2(M);
+    if mod(length(bits), k) ~= 0
+        error("Bit length must be multiple of log2(M).");
+    end
+
+    m = sqrt(M);
+    if abs(m - round(m)) > 0
+        error("M must be a square QAM (4,16,64...).");
+    end
+    m = round(m);
+    bps = k/2; % bits per axis (I and Q)
+
+    bits = bits(:);
+    B = reshape(bits, k, []).';           % [nSyms x k]
+    bI = B(:, 1:bps);
+    bQ = B(:, bps+1:end);
+
+    % Convert Gray-coded bits -> integer index per axis
+    gI = bi2int(bI);
+    gQ = bi2int(bQ);
+    iI = gray2bin_int(gI);
+    iQ = gray2bin_int(gQ);
+
+    % Map integer [0..m-1] -> PAM levels [-m+1, ..., +m-1] step 2
+    aI = 2*iI - (m-1);
+    aQ = 2*iQ - (m-1);
+
+    syms = aI + 1i*aQ;
+
+    % Normalize to unit average energy
+    Es_avg = mean(abs(syms).^2);
+    syms = syms / sqrt(Es_avg);
+end
+
+function bits = qam_gray_demod(syms, M)
+    % Hard-decision Gray demapper for square QAM (unit-average-energy assumed)
+    k = log2(M);
+    m = round(sqrt(M));
+    bps = k/2;
+
+    % Determine normalization factor used by modulator:
+    % For ideal square QAM with levels ±(m-1), step 2, average energy per axis = (m^2-1)/3
+    % total average Es = 2*(m^2-1)/3. So normalize factor = sqrt(2*(m^2-1)/3)
+    normFactor = sqrt(2*(m^2-1)/3);
+    syms = syms * normFactor;
+
+    I = real(syms);
+    Q = imag(syms);
+
+    % Slice to nearest PAM level
+    levels = (-(m-1):2:(m-1));
+    idxI = slicer_to_index(I, levels); % integer index 0..m-1 (binary index)
+    idxQ = slicer_to_index(Q, levels);
+
+    % Convert binary index -> Gray index
+    gI = bin2gray_int(idxI);
+    gQ = bin2gray_int(idxQ);
+
+    % Convert to bits (Gray bits)
+    bI = int2bits(gI, bps);
+    bQ = int2bits(gQ, bps);
+
+    % Concatenate [Ibits Qbits]
+    bitsMat = [bI bQ];                  % [nSyms x k]
+    bits = reshape(bitsMat.', [], 1);   % column vector
+end
+
+function idx = slicer_to_index(x, levels)
+    % Map each x to nearest level, then to index 0..m-1
+    m = length(levels);
+    idx = zeros(size(x));
+    for n = 1:numel(x)
+        [~, ii] = min(abs(x(n) - levels));
+        idx(n) = ii - 1; % 0-based
+    end
+end
+
+function v = bi2int(B)
+    % B: [n x b] bits (MSB first) -> integer [0..2^b-1]
+    b = size(B,2);
+    w = 2.^(b-1:-1:0);
+    v = B * w.';
+end
+
+function B = int2bits(v, b)
+    % v: integer column, output bits [n x b] MSB first
+    v = v(:);
+    n = length(v);
+    B = zeros(n,b);
+    for i = 1:b
+        shift = b - i;
+        B(:,i) = bitget(v, shift+1);
+    end
+end
+
+function b = gray2bin_int(g)
+    % Gray int -> binary int
+    g = uint32(g);
+    b = g;
+    while any(g)
+        g = bitshift(g, -1);
+        b = bitxor(b, g);
+    end
+    b = double(b);
+end
+
+function g = bin2gray_int(b)
+    % Binary int -> Gray int
+    b = uint32(b);
+    g = bitxor(b, bitshift(b, -1));
+    g = double(g);
+end

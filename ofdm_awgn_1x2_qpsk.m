@@ -28,17 +28,41 @@ for e = 1:length(EbNo_dB)
 
     for run = 1:numRuns
 
-        %% ---------- TRANSMITTER ----------
-        numBits = N * k0 * numSymRun;
-        txBits  = randi([0 1], numBits, 1);
+%% ---------- TRANSMITTER ----------
+% 1. Build the frequency-domain grid (N subcarriers x numSymRun symbols)
+X = zeros(N, numSymRun);
 
-        txSyms = qam_gray_mod(txBits, M);      % unit avg energy
-        X = reshape(txSyms, N, numSymRun);
+% 2. Insert Pilot Symbols [cite: 87-91]
+% As per project instructions, we use the 1st OFDM symbol as a pilot[cite: 106].
+X(:,1) = pilotSym; 
 
-        x_time = ifft(X, N, 1);
-        x_cp   = [x_time(end-cp_len+1:end, :); x_time];
-        tx_serial = x_cp(:);
+% 3. Calculate Bit Requirements for (7,4) Channel Coding
+% We only use Symbols 2 to end for data[cite: 106].
+numDataSym = numSymRun - 1; 
+nCodedBitsNeeded = N * k0 * numDataSym; 
 
+% Since (7,4) code turns 4 raw bits into 7 coded bits, generate 4/7ths of the capacity[cite: 101].
+numRawBits = floor(nCodedBitsNeeded * (4/7));
+txDataBits = randi([0 1], numRawBits, 1); % Your original information bits [cite: 98]
+
+% 4. ADD CHANNEL CODING [cite: 82-84, 99]
+% This turns your raw information bits into "Coded Bits" with redundancy.
+txCodedBits = encode74(txDataBits); 
+
+% 5. Map the CODED bits to symbols (QPSK, 16-QAM, or 64-QAM) [cite: 102]
+dataSyms = qam_gray_mod(txCodedBits, M);               
+
+% 6. Pack symbols into the OFDM grid (Starting from Symbol 2)
+X(:,2:end) = reshape(dataSyms, N, numDataSym);
+
+% 7. OFDM modulation (IFFT) [cite: 93, 119]
+% Converts the frequency subcarriers into a time-domain signal.
+x_time = ifft(X, N, 1);                           
+
+% 8. Add Cyclic Prefix (CP) and serialize [cite: 95, 120-121]
+% Prevents Inter-Symbol Interference (ISI) by copying the end of the symbol to the front[cite: 121].
+x_cp = [x_time(end-cp_len+1:end, :); x_time];     
+tx_serial = x_cp(:);
         %% ---------- CHANNEL (2 independent AWGN branches) ----------
         % Eb/N0 -> SNR per time-domain sample (accounts for CP overhead)
         SNRlin = EbNoLin * k0 * (N / (N + cp_len));
@@ -52,29 +76,45 @@ for e = 1:length(EbNo_dB)
         rx1_serial = tx_serial + noise1;
         rx2_serial = tx_serial + noise2;
 
-        %% ---------- RECEIVER ----------
-        rx1_par = reshape(rx1_serial, N+cp_len, numSymRun);
-        rx2_par = reshape(rx2_serial, N+cp_len, numSymRun);
+      %% ---------- RECEIVER ----------
+% 1. Reshape and Remove CP per branch [cite: 121-122]
+rx1_par = reshape(rx1_serial, N+cp_len, numSymRun);
+rx2_par = reshape(rx2_serial, N+cp_len, numSymRun);
 
-        rx1_no_cp = rx1_par(cp_len+1:end, :);
-        rx2_no_cp = rx2_par(cp_len+1:end, :);
+rx1_no_cp = rx1_par(cp_len+1:end, :);
+rx2_no_cp = rx2_par(cp_len+1:end, :);
 
-        % Equal-Gain Combining (sum) in time-domain
-        rx_no_cp = rx1_no_cp + rx2_no_cp;
+% 2. Combining Strategy
+% For AWGN, Equal-Gain Combining (summing) works well.
+% For Fading, you would typically use MRC in the frequency domain after FFT.
+rx_combined_time = rx1_no_cp + rx2_no_cp;
 
-        Yf = fft(rx_no_cp, N, 1);
-        rxSyms = Yf(:);
+% 3. FFT (Demodulation) [cite: 119]
+Yf = fft(rx_combined_time, N, 1);
 
-        rxBits = qam_gray_demod(rxSyms, M);
+% 4. Data Extraction
+% We only care about data symbols (Symbols 2 to end), as Symbol 1 was the Pilot.
+Ydata = Yf(:, 2:end);
+rxSyms = Ydata(:);
 
-        err = sum(txBits ~= rxBits);
-        totalErr  = totalErr + err;
-        totalBits = totalBits + length(txBits);
-    end
+% 5. Demap Symbols to Coded Bits
+% This turns complex numbers back into the 0s and 1s (still containing parity) [cite: 102]
+rxCodedBits = qam_gray_demod(rxSyms, M);
 
-    BER(e) = totalErr / totalBits;
-    fprintf('Eb/N0 = %2d dB, BER = %.3e\n', EbNo_dB(e), BER(e));
-end
+% 6. ADD CHANNEL DECODING [cite: 82-84, 101]
+% This uses the (7,4) math to fix single-bit errors and recover the 4-bit info blocks
+rxDecodedBits = decode74(rxCodedBits); 
+
+%% ---------- BIT ERROR RATE (BER) ----------
+% IMPORTANT: Compare the DECODED bits to the ORIGINAL raw bits (txDataBits)
+% We use min() to ensure matching lengths for the comparison.
+nCompare = min(length(txDataBits), length(rxDecodedBits));
+
+% Calculate errors based on the actual information recovered
+err = sum(txDataBits(1:nCompare) ~= rxDecodedBits(1:nCompare));
+
+totalErr  = totalErr + err;
+totalBits = totalBits + nCompare;
 
 %% Plot
 figure;

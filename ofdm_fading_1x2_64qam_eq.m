@@ -25,46 +25,90 @@ h1 = (randn(1,L) + 1i*randn(1,L)) / sqrt(2*L);
 h2 = (randn(1,L) + 1i*randn(1,L)) / sqrt(2*L);
 BER = zeros(size(EbNo_dB));
 
-%% Main simulation (Logic matches SIMO QPSK EQ base)
+%% Main simulation (Integrated SIMO 1x2 + Channel Coding)
 for e = 1:length(EbNo_dB)
     EbNoLin = 10^(EbNo_dB(e)/10);
     totalErr = 0; totalBits = 0;
+    
     for run = 1:numRuns
+        %% ---------- TRANSMITTER ----------
+        % 1. Frequency-domain grid initialization
         X = zeros(N, numSymRun);
-        X(:,1) = pilotSym;  
-        numDataBits = N * k0 * numDataSym;
-        txBits = randi([0 1], numDataBits, 1);
-        dataSyms = qam_gray_mod(txBits, M);
+        X(:,1) = pilotSym;  % Pilot symbol for channel estimation [cite: 104-106]
+        
+        % 2. Calculate bit requirements for (7,4) Channel Coding
+        % We only use Symbols 2 to end for data [cite: 106-107]
+        nCodedBitsNeeded = N * k0 * numDataSym; 
+        
+        % Generate raw bits at 4/7 rate of the total capacity
+        numRawBits = floor(nCodedBitsNeeded * (4/7));
+        txDataBits = randi([0 1], numRawBits, 1); % Information bits
+
+        % 3. ENCODE (Channel Coding) [cite: 82-84, 99-100]
+        % Transform 4-bit blocks into 7-bit codewords
+        txCodedBits = encode74(txDataBits); 
+
+        % 4. Map CODED bits to symbols and pack into OFDM grid
+        dataSyms = qam_gray_mod(txCodedBits, M);               
         X(:,2:end) = reshape(dataSyms, N, numDataSym);
+        
+        % 5. OFDM Modulation (IFFT) and Cyclic Prefix (CP) [cite: 93, 119-121]
         x_time = ifft(X, N, 1);
         x_cp = [x_time(end-cp_len+1:end, :); x_time];
         tx_serial = x_cp(:);
+
+        %% ---------- CHANNEL SIMULATION (SIMO 1x2) ----------
+        % Calculate Noise variance [cite: 133-135]
         SNRlin = EbNoLin * k0 * (N / (N + cp_len));
         Ps = mean(abs(tx_serial).^2);
         sigma2 = Ps / SNRlin;
+        
+        % Apply independent fading channels (h1 and h2) [cite: 137-144]
         tx_blocks = reshape(tx_serial, N+cp_len, numSymRun);
         rx1_blocks = zeros(size(tx_blocks)); rx2_blocks = zeros(size(tx_blocks));
         for s = 1:numSymRun
             rx1_blocks(:,s) = conv(tx_blocks(:,s), h1, 'same');
             rx2_blocks(:,s) = conv(tx_blocks(:,s), h2, 'same');
         end
-        rx1_faded = rx1_blocks(:); rx2_faded = rx2_blocks(:);
-        noise1 = sqrt(sigma2/2) * (randn(size(rx1_faded)) + 1i*randn(size(rx1_faded)));
-        noise2 = sqrt(sigma2/2) * (randn(size(rx2_faded)) + 1i*randn(size(rx2_faded)));
-        rx1_serial = rx1_faded + noise1; rx2_serial = rx2_faded + noise2;
-        rx1_par = reshape(rx1_serial, N+cp_len, numSymRun);
-        rx2_par = reshape(rx2_serial, N+cp_len, numSymRun);
-        rx1_no_cp = rx1_par(cp_len+1:end, :); rx2_no_cp = rx2_par(cp_len+1:end, :);
-        Y1f = fft(rx1_no_cp, N, 1); Y2f = fft(rx2_no_cp, N, 1);
-        H1 = Y1f(:,1) ./ X(:,1); H2 = Y2f(:,1) ./ X(:,1);
+        
+        % Add independent AWGN to both antenna branches
+        noise1 = sqrt(sigma2/2) * (randn(size(rx1_blocks)) + 1i*randn(size(rx1_blocks)));
+        noise2 = sqrt(sigma2/2) * (randn(size(rx2_blocks)) + 1i*randn(size(rx2_blocks)));
+        rx1_serial = rx1_blocks + noise1; 
+        rx2_serial = rx2_blocks + noise2;
+
+        %% ---------- RECEIVER ----------
+        % 1. CP Removal and FFT per branch [cite: 121-123]
+        rx1_no_cp = rx1_serial(cp_len+1:end, :); 
+        rx2_no_cp = rx2_serial(cp_len+1:end, :);
+        Y1f = fft(rx1_no_cp, N, 1); 
+        Y2f = fft(rx2_no_cp, N, 1);
+        
+        % 2. Channel Estimation [cite: 104-107, 149]
+        H1 = Y1f(:,1) ./ X(:,1); 
+        H2 = Y2f(:,1) ./ X(:,1);
         H1(abs(H1) < 1e-12) = 1e-12; H2(abs(H2) < 1e-12) = 1e-12;
+        
+        % 3. MRC Combining (Maximum Ratio Combining) [cite: 130, 163]
         Y1d = Y1f(:,2:end); Y2d = Y2f(:,2:end);
         den = (abs(H1).^2 + abs(H2).^2);
         den(den < 1e-12) = 1e-12;
         Yeq = (conj(H1).*Y1d + conj(H2).*Y2d) ./ den;
-        rxSyms = Yeq(:); rxBits = qam_gray_demod(rxSyms, M);
-        err = sum(txBits ~= rxBits);
-        totalErr = totalErr + err; totalBits = totalBits + length(txBits);
+        
+        % 4. Demapping (Symbols -> Coded Bits)
+        rxCodedBits = qam_gray_demod(Yeq(:), M);
+
+        % 5. DECODE (Channel Decoding) [cite: 82-84, 101]
+        % Use the (7,4) math to fix single-bit errors
+        rxDecodedBits = decode74(rxCodedBits); 
+
+        %% ---------- BIT ERROR RATE (BER) ----------
+        % Compare recovered info against original info bits [cite: 23-24]
+        nCompare = min(length(txDataBits), length(rxDecodedBits));
+        err = sum(txDataBits(1:nCompare) ~= rxDecodedBits(1:nCompare));
+        
+        totalErr = totalErr + err; 
+        totalBits = totalBits + nCompare;
     end
     BER(e) = totalErr / totalBits;
     fprintf('Eb/N0 = %2d dB, BER = %.3e\n', EbNo_dB(e), BER(e));

@@ -67,6 +67,9 @@ for mi = 1:length(mods)
                     % Data bits for ALL data subcarriers across data OFDM symbols
                     nDataQamSyms = N * numDataSym;
                     txBits = randi([0 1], nDataQamSyms * k0, 1);
+                    % 4. ADD CHANNEL CODING HERE
+                    % OLD: txCodedBits = txDataBits; 
+                    txCodedBits = encode74(txDataBits);
 
                     % Map to unit-average-energy QAM symbols (Gray)
                     dataSyms = qam_gray_mod(txBits, M);      % column vector length nDataQamSyms
