@@ -17,104 +17,114 @@ numSymRun  = 100;         % OFDM symbols per run
 M  = 4;
 k0 = log2(M);
 
+% Pilot (needed for structure, even if unused in pure AWGN)
+pilotSym = (1+1i)/sqrt(2) * ones(N, 1);
+
 BER = zeros(size(EbNo_dB));
 
 %% Main simulation
 for e = 1:length(EbNo_dB)
     EbNoLin = 10^(EbNo_dB(e)/10);
-
     totalErr  = 0;
     totalBits = 0;
+    
+    % Code Rate
+    codeRate = 4/7;
 
     for run = 1:numRuns
-
-%% ---------- TRANSMITTER ----------
-% 1. Build the frequency-domain grid (N subcarriers x numSymRun symbols)
-X = zeros(N, numSymRun);
-
-% 2. Insert Pilot Symbols [cite: 87-91]
-% As per project instructions, we use the 1st OFDM symbol as a pilot[cite: 106].
-X(:,1) = pilotSym; 
-
-% 3. Calculate Bit Requirements for (7,4) Channel Coding
-% We only use Symbols 2 to end for data[cite: 106].
-numDataSym = numSymRun - 1; 
-nCodedBitsNeeded = N * k0 * numDataSym; 
-
-% Since (7,4) code turns 4 raw bits into 7 coded bits, generate 4/7ths of the capacity[cite: 101].
-numRawBits = floor(nCodedBitsNeeded * (4/7));
-txDataBits = randi([0 1], numRawBits, 1); % Your original information bits [cite: 98]
-
-% 4. ADD CHANNEL CODING [cite: 82-84, 99]
-% This turns your raw information bits into "Coded Bits" with redundancy.
-txCodedBits = encode74(txDataBits); 
-
-% 5. Map the CODED bits to symbols (QPSK, 16-QAM, or 64-QAM) [cite: 102]
-dataSyms = qam_gray_mod(txCodedBits, M);               
-
-% 6. Pack symbols into the OFDM grid (Starting from Symbol 2)
-X(:,2:end) = reshape(dataSyms, N, numDataSym);
-
-% 7. OFDM modulation (IFFT) [cite: 93, 119]
-% Converts the frequency subcarriers into a time-domain signal.
-x_time = ifft(X, N, 1);                           
-
-% 8. Add Cyclic Prefix (CP) and serialize [cite: 95, 120-121]
-% Prevents Inter-Symbol Interference (ISI) by copying the end of the symbol to the front[cite: 121].
-x_cp = [x_time(end-cp_len+1:end, :); x_time];     
-tx_serial = x_cp(:);
+        %% ---------- TRANSMITTER ----------
+        % 1. Build the frequency-domain grid
+        X = zeros(N, numSymRun);
+        
+        % 2. Insert Pilot Symbols
+        X(:,1) = pilotSym; 
+        
+        % 3. Calculate Bit Requirements for (7,4) Channel Coding
+        numDataSym = numSymRun - 1; 
+        
+        % Capacity in coded bits
+        nCodedBitsAvailable = N * k0 * numDataSym; 
+        
+        % Ensure multiple of 7 for Hamming
+        nCodedBitsNeeded = floor(nCodedBitsAvailable/7) * 7;
+        
+        % Calculate raw bits
+        numRawBits = nCodedBitsNeeded * codeRate;
+        
+        txDataBits = randi([0 1], numRawBits, 1); 
+        
+        % 4. ADD CHANNEL CODING (External Function)
+        txCodedBits = encode74(txDataBits); 
+        
+        % 5. Map the CODED bits to symbols
+        dataSyms = qam_gray_mod(txCodedBits, M);               
+        
+        % 6. Pack symbols into the OFDM grid
+        dataGrid = reshape(dataSyms, N, []);
+        colsFilled = size(dataGrid, 2);
+        X(:, 2:1+colsFilled) = dataGrid;
+        
+        % 7. OFDM modulation (IFFT)
+        x_time = ifft(X, N, 1);                           
+        
+        % 8. Add Cyclic Prefix (CP) and serialize
+        x_cp = [x_time(end-cp_len+1:end, :); x_time];     
+        tx_serial = x_cp(:);
+        
         %% ---------- CHANNEL (2 independent AWGN branches) ----------
-        % Eb/N0 -> SNR per time-domain sample (accounts for CP overhead)
-        SNRlin = EbNoLin * k0 * (N / (N + cp_len));
-
+        % Eb/N0 -> SNR per time-domain sample
+        % MUST account for Code Rate (4/7)
+        SNRlin = EbNoLin * k0 * codeRate * (N / (N + cp_len));
+        
         Ps     = mean(abs(tx_serial).^2);
         sigma2 = Ps / SNRlin;
-
+        
         noise1 = sqrt(sigma2/2) * (randn(size(tx_serial)) + 1i*randn(size(tx_serial)));
         noise2 = sqrt(sigma2/2) * (randn(size(tx_serial)) + 1i*randn(size(tx_serial)));
-
+        
         rx1_serial = tx_serial + noise1;
         rx2_serial = tx_serial + noise2;
-
-      %% ---------- RECEIVER ----------
-% 1. Reshape and Remove CP per branch [cite: 121-122]
-rx1_par = reshape(rx1_serial, N+cp_len, numSymRun);
-rx2_par = reshape(rx2_serial, N+cp_len, numSymRun);
-
-rx1_no_cp = rx1_par(cp_len+1:end, :);
-rx2_no_cp = rx2_par(cp_len+1:end, :);
-
-% 2. Combining Strategy
-% For AWGN, Equal-Gain Combining (summing) works well.
-% For Fading, you would typically use MRC in the frequency domain after FFT.
-rx_combined_time = rx1_no_cp + rx2_no_cp;
-
-% 3. FFT (Demodulation) [cite: 119]
-Yf = fft(rx_combined_time, N, 1);
-
-% 4. Data Extraction
-% We only care about data symbols (Symbols 2 to end), as Symbol 1 was the Pilot.
-Ydata = Yf(:, 2:end);
-rxSyms = Ydata(:);
-
-% 5. Demap Symbols to Coded Bits
-% This turns complex numbers back into the 0s and 1s (still containing parity) [cite: 102]
-rxCodedBits = qam_gray_demod(rxSyms, M);
-
-% 6. ADD CHANNEL DECODING [cite: 82-84, 101]
-% This uses the (7,4) math to fix single-bit errors and recover the 4-bit info blocks
-rxDecodedBits = decode74(rxCodedBits); 
-
-%% ---------- BIT ERROR RATE (BER) ----------
-% IMPORTANT: Compare the DECODED bits to the ORIGINAL raw bits (txDataBits)
-% We use min() to ensure matching lengths for the comparison.
-nCompare = min(length(txDataBits), length(rxDecodedBits));
-
-% Calculate errors based on the actual information recovered
-err = sum(txDataBits(1:nCompare) ~= rxDecodedBits(1:nCompare));
-
-totalErr  = totalErr + err;
-totalBits = totalBits + nCompare;
+        
+        %% ---------- RECEIVER ----------
+        % 1. Reshape and Remove CP per branch
+        rx1_par = reshape(rx1_serial, N+cp_len, numSymRun);
+        rx2_par = reshape(rx2_serial, N+cp_len, numSymRun);
+        
+        rx1_no_cp = rx1_par(cp_len+1:end, :);
+        rx2_no_cp = rx2_par(cp_len+1:end, :);
+        
+        % 2. Combining Strategy (Equal Gain for AWGN)
+        rx_combined_time = rx1_no_cp + rx2_no_cp;
+        
+        % 3. FFT (Demodulation)
+        Yf = fft(rx_combined_time, N, 1);
+        
+        % 4. Data Extraction
+        % Use colsFilled to ensure we only grab valid data
+        Ydata = Yf(:, 2:1+colsFilled);
+        
+        % Important: Since we summed 2 signals (Signal + Signal = 2*Signal), 
+        % we must scale down by 2 before demapping to match unit energy grid.
+        Ydata = Ydata / 2;
+        
+        rxSyms = Ydata(:);
+        
+        % 5. Demap Symbols to Coded Bits
+        rxCodedBits = qam_gray_demod(rxSyms, M);
+        
+        % 6. ADD CHANNEL DECODING (External Function)
+        rxDecodedBits = decode74(rxCodedBits); 
+        
+        %% ---------- BIT ERROR RATE (BER) ----------
+        nCompare = min(length(txDataBits), length(rxDecodedBits));
+        err = sum(txDataBits(1:nCompare) ~= rxDecodedBits(1:nCompare));
+        
+        totalErr  = totalErr + err;
+        totalBits = totalBits + nCompare;
+    end
+    BER(e) = totalErr / totalBits;
+    fprintf('Eb/N0 = %2d dB, BER = %.3e\n', EbNo_dB(e), BER(e));
+end
 
 %% Plot
 figure;
@@ -133,59 +143,40 @@ function syms = qam_gray_mod(bits, M)
     if mod(numel(bits), k) ~= 0
         error("Bit length must be multiple of log2(M).");
     end
-
     m = round(sqrt(M));
-    if m*m ~= M
-        error("M must be a perfect square (4,16,64...).");
-    end
-
     bps  = k/2;
     bits = bits(:);
     B = reshape(bits, k, []).';     % [nSyms x k]
     bI = B(:,1:bps);
     bQ = B(:,bps+1:end);
-
     gI = bi2int(bI);
     gQ = bi2int(bQ);
-
     iI = gray2bin_int(gI);
     iQ = gray2bin_int(gQ);
-
     aI = 2*iI - (m-1);
     aQ = 2*iQ - (m-1);
-
     syms = (aI + 1i*aQ);
-
     % Normalize to unit avg energy
     syms = syms / sqrt(mean(abs(syms).^2));
 end
 
 function bits = qam_gray_demod(syms, M)
-    % Hard decision Gray demapper for square QAM, assumes unit-average-energy symbols.
+    % Hard decision Gray demapper for square QAM
     k = log2(M);
     m = round(sqrt(M));
-    if m*m ~= M
-        error("M must be a perfect square (4,16,64...).");
-    end
     bps = k/2;
-
     % Undo theoretical normalization for slicing
     normFactor = sqrt(2*(m^2-1)/3);
     syms = syms * normFactor;
-
     I = real(syms);
     Q = imag(syms);
-
     levels = (-(m-1):2:(m-1));
     idxI = slicer_to_index(I, levels);
     idxQ = slicer_to_index(Q, levels);
-
     gI = bin2gray_int(idxI);
     gQ = bin2gray_int(idxQ);
-
     bI = int2bits(gI, bps);
     bQ = int2bits(gQ, bps);
-
     bitsMat = [bI bQ];
     bits = reshape(bitsMat.', [], 1);
 end
@@ -194,7 +185,7 @@ function idx = slicer_to_index(x, levels)
     idx = zeros(size(x));
     for n = 1:numel(x)
         [~, ii] = min(abs(x(n) - levels));
-        idx(n) = ii - 1; % 0-based
+        idx(n) = ii - 1; 
     end
 end
 

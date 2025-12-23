@@ -50,12 +50,13 @@ for e = 1:length(EbNo_dB)
         
         % 1. Data Bit Generation
         % Calculate exact bits needed to fill the data symbols
-        nCodedBitsNeeded = N * k0 * numDataSym;
+        nCodedBitsAvailable = N * k0 * numDataSym;
+        
         % We need a multiple of 7 for the coded bits to fit the decoder
-        nCodedBitsNeeded = floor(nCodedBitsNeeded/7) * 7;
+        nCodedBitsNeeded = floor(nCodedBitsAvailable/7) * 7;
         
         nRawBits = nCodedBitsNeeded * codeRate; 
-        txDataBits = randi([0 1], nRawBits, 1);
+        txDataBits = randi([0 1], numRawBits, 1);
         
         % 2. Channel Coding (Hamming 7,4) - EXTERNAL FUNCTION
         txCodedBits = encode74(txDataBits);
@@ -80,7 +81,9 @@ for e = 1:length(EbNo_dB)
         %% --- CHANNEL (SIMO 1x2) ---
         
         % Calculate Noise Power
+        % MUST account for Code Rate (4/7)
         SNRlin = EbNoLin * k0 * codeRate * (N / (N + cp_len));
+        
         sigPower = mean(abs(tx_serial).^2);
         noisePower = sigPower / SNRlin;
         
@@ -156,9 +159,6 @@ legend('SIMO 1x2 (Estimated Channel)');
 ylim([1e-5 1]);
 
 %% -------------------- Local Helper Functions --------------------
-% (Only Modulation helpers remain here. If you moved these to external files
-% as well, you can delete them from here.)
-
 function syms = qam_gray_mod(bits, M)
     k = log2(M);
     m = round(sqrt(M));

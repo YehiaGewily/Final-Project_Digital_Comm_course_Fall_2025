@@ -1,9 +1,14 @@
-%% OFDM Project - Phase 4: Pilot-Based Channel Estimation & ZF Equalization (SISO 16-QAM)
-% 1x1 SISO, 16-QAM, fixed multipath fading (L=50) + AWGN
+%% OFDM Project - Phase 4: Pilot-Based Channel Estimation & ZF Equalization (SISO 64-QAM)
+% 1x1 SISO, 64-QAM, fixed multipath fading (L=50) + AWGN
+% Pilot scheme: 1st OFDM symbol is all pilots (known), rest are data
+% Channel estimation: Hest = Ypilot ./ Xpilot
+% Equalization: Yeq = Ydata ./ Hest
+% Expected: BER improves significantly vs. "no EQ" fading case.
+
 clear; clc; close all;
 rng(1);
 
-%% Parameters (project)
+%% Parameters
 N          = 1024;       % FFT size
 L          = 50;         % channel taps
 cp_len     = 72;         % CP length
@@ -21,72 +26,95 @@ k0 = log2(M);
 pilotSym = (1+1i)/sqrt(2);  % unit-energy
 
 % Fixed deterministic channel realization
-h = (randn(1,L) + 1i*randn(1,L)) / sqrt(2*L);
+% Normalized to unit power
+h = (randn(1,L) + 1i*randn(1,L));
+h = h / norm(h);
+
 BER = zeros(size(EbNo_dB));
 
-%% Main simulation (Integrated with (7,4) Channel Coding)
+%% Main simulation
 for e = 1:length(EbNo_dB)
     EbNoLin = 10^(EbNo_dB(e)/10);
     totalErr = 0; totalBits = 0;
     
+    % Code Rate
+    codeRate = 4/7;
+
     for run = 1:numRuns
         %% ---------- TRANSMITTER ----------
         X = zeros(N, numSymRun);
-        X(:,1) = pilotSym;  % Insert pilot symbol in the first column [cite: 104-106]
+        X(:,1) = pilotSym;  % Insert pilot symbol in the first column
         
-        % 1. Calculate RAW bit requirements (4/7 code rate)
-        nCodedBitsNeeded = N * k0 * numDataSym;
-        numRawBits = floor(nCodedBitsNeeded * (4/7));
-        txDataBits = randi([0 1], numRawBits, 1); % Your original information
-
-        % 2. ENCODE (Channel Coding) [cite: 82, 99]
+        % 1. Calculate how many RAW bits we need (4/7ths of the coded capacity)
+        nCodedBitsAvailable = N * k0 * numDataSym;
+        
+        % Ensure multiple of 7 for Hamming
+        nCodedBitsNeeded = floor(nCodedBitsAvailable/7) * 7;
+        
+        % Calculate raw bits
+        numRawBits = nCodedBitsNeeded * codeRate;
+        
+        txDataBits = randi([0 1], numRawBits, 1);
+        
+        % 2. ENCODE the bits using (7,4) Linear Block Code
         txCodedBits = encode74(txDataBits); 
-
-        % 3. Map bits to symbols and pack the grid [cite: 102]
-        dataSyms = qam_gray_mod(txCodedBits, M);               
-        X(:,2:end) = reshape(dataSyms, N, numDataSym);
         
-        % 4. OFDM Modulation (IFFT) and Cyclic Prefix [cite: 93, 95, 119-121]
+        % 3. Map bits to symbols and pack the grid
+        dataSyms = qam_gray_mod(txCodedBits, M);               
+        
+        % Reshape carefully
+        dataGrid = reshape(dataSyms, N, []);
+        colsFilled = size(dataGrid, 2);
+        X(:, 2:1+colsFilled) = dataGrid;
+        
+        % 4. OFDM Modulation (IFFT) and Cyclic Prefix
         x_time = ifft(X, N, 1);
         x_cp = [x_time(end-cp_len+1:end, :); x_time];
         tx_serial = x_cp(:);
-
+        
         %% ---------- CHANNEL SIMULATION ----------
-        % Calculate Noise and Apply Fading [cite: 133-137]
-        SNRlin = EbNoLin * k0 * (N / (N + cp_len));
+        % Calculate Noise and Apply Fading
+        % MUST account for Code Rate (4/7)
+        SNRlin = EbNoLin * k0 * codeRate * (N / (N + cp_len));
+        
         Ps = mean(abs(tx_serial).^2);
         sigma2 = Ps / SNRlin;
         
-        tx_blocks = reshape(tx_serial, N+cp_len, numSymRun);
-        rx_blocks = zeros(size(tx_blocks));
-        for s = 1:numSymRun
-            rx_blocks(:,s) = conv(tx_blocks(:,s), h, 'same');
-        end
+        % Apply Fading using FILTER (Corrects timing vs. conv)
+        rx_serial_clean = filter(h, 1, tx_serial);
         
-        rx_faded = rx_blocks(:);
-        noise = sqrt(sigma2/2) * (randn(size(rx_faded)) + 1i*randn(size(rx_faded)));
-        rx_serial = rx_faded + noise;
-
+        % Add AWGN
+        noise = sqrt(sigma2/2) * (randn(size(rx_serial_clean)) + 1i*randn(size(rx_serial_clean)));
+        rx_serial = rx_serial_clean + noise;
+        
         %% ---------- RECEIVER ----------
-        % 1. CP Removal and FFT [cite: 122-123]
+        % 1. CP Removal and FFT
         rx_parallel = reshape(rx_serial, N+cp_len, numSymRun);
         rx_no_cp = rx_parallel(cp_len+1:end, :);       
         Yf = fft(rx_no_cp, N, 1);                          
         
-        % 2. Channel Estimation and Equalization [cite: 104, 107]
+        % 2. Channel Estimation and Equalization 
         Hest = Yf(:,1) ./ X(:,1);
-        Hest(abs(Hest) < 1e-12) = 1e-12;                   
-        Yeq = Yf(:,2:end) ./ Hest;                         
         
-        % 3. Demapping (Symbols -> Coded Bits)
+        % Replicate for all data columns
+        H_grid = repmat(Hest, 1, colsFilled);
+        
+        % Regularize
+        H_grid(abs(H_grid) < 1e-12) = 1e-12;                   
+        
+        % Equalize
+        Y_data = Yf(:, 2:1+colsFilled);
+        Yeq = Y_data ./ H_grid;                         
+        
+        % 3. Demapping (Symbol -> Coded Bits)
         rxSyms = Yeq(:);
         rxCodedBits = qam_gray_demod(rxSyms, M);
-
-        % 4. DECODE (Channel Decoding) [cite: 101]
+        
+        % 4. DECODE the bits back to raw data 
         rxDecodedBits = decode74(rxCodedBits); 
-
+        
         %% ---------- BIT ERROR RATE (BER) ----------
-        % Compare decoded data back to original source bits [cite: 23-24]
+        % Compare decoded bits to original raw bits
         nCompare = min(length(txDataBits), length(rxDecodedBits));
         err = sum(txDataBits(1:nCompare) ~= rxDecodedBits(1:nCompare));
         
@@ -98,11 +126,10 @@ for e = 1:length(EbNo_dB)
 end
 
 %% Plot
-figure; semilogy(EbNo_dB, BER, 'r-o', 'LineWidth', 1.5); grid on;
+figure; semilogy(EbNo_dB, BER, 'k-s', 'LineWidth', 1.5); grid on;
 xlabel('E_b/N_0 (dB)'); ylabel('BER');
-title('16-QAM OFDM SISO: Fixed Multipath + AWGN (Pilot Hest + ZF EQ)');
-legend('1x1 fading + 16-QAM EQ');
-% (Helper functions identical to QPSK EQ base)
+title('64-QAM OFDM SISO: Fixed Multipath + AWGN (Pilot Hest + ZF EQ)');
+legend('1x1 fading + 64-QAM EQ');
 
 %% -------------------- Helper Functions --------------------
 function syms = qam_gray_mod(bits, M)
@@ -111,61 +138,47 @@ function syms = qam_gray_mod(bits, M)
     if mod(numel(bits), k) ~= 0
         error("Bit length must be multiple of log2(M).");
     end
-
     m = round(sqrt(M));
     if m*m ~= M
         error("M must be a perfect square (4,16,64...).");
     end
-
     bps = k/2;
     bits = bits(:);
     B = reshape(bits, k, []).';        % [nSyms x k]
     bI = B(:,1:bps);
     bQ = B(:,bps+1:end);
-
     gI = bi2int(bI);                  % Gray index
     gQ = bi2int(bQ);
-
     iI = gray2bin_int(gI);            % binary index
     iQ = gray2bin_int(gQ);
-
     aI = 2*iI - (m-1);                % PAM levels
     aQ = 2*iQ - (m-1);
-
     % Theoretical normalization for square QAM:
     % E[|aI + j aQ|^2] = 2*(m^2-1)/3
     normFactor = sqrt(2*(m^2-1)/3);
-
     syms = (aI + 1i*aQ) / normFactor; % unit average energy
 end
 
 function bits = qam_gray_demod(syms, M)
-    % Hard decision Gray demapper for square QAM, assumes mod used theoretical normalization.
+    % Hard decision Gray demapper for square QAM.
     k = log2(M);
     m = round(sqrt(M));
     if m*m ~= M
         error("M must be a perfect square (4,16,64...).");
     end
     bps = k/2;
-
     % Undo normalization back to integer-grid levels
     normFactor = sqrt(2*(m^2-1)/3);
     syms = syms * normFactor;
-
     I = real(syms);
     Q = imag(syms);
-
     levels = (-(m-1):2:(m-1));        % allowed PAM levels
-
     idxI = slicer_to_index(I, levels); % binary index 0..m-1
     idxQ = slicer_to_index(Q, levels);
-
     gI = bin2gray_int(idxI);           % Gray index
     gQ = bin2gray_int(idxQ);
-
     bI = int2bits(gI, bps);            % Gray bits
     bQ = int2bits(gQ, bps);
-
     bitsMat = [bI bQ];                 % [nSyms x k]
     bits = reshape(bitsMat.', [], 1);
 end
