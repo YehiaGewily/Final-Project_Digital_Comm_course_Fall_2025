@@ -1,0 +1,264 @@
+%% OFDM Project - Phase 5B: SIMO 1x2 Fixed Fading + Pilot Est + MRC (DEBUG VERSION)
+% Status: Hamming Coding DISABLED to verify OFDM chain first.
+% 1 Tx -> 2 Rx antennas (SIMO)
+clear; clc; close all;
+rng(1); % Set seed for reproducibility
+
+%% 1. Parameters
+N           = 1024;      % FFT size
+L           = 50;        % Channel taps
+cp_len      = 72;        % CP length
+EbNo_dB     = 0:2:30;    % Eb/N0 sweep range
+numRuns     = 200;       % Iterations per SNR
+numSymRun   = 50;        % OFDM symbols per frame
+numPilotSym = 1;         % First symbol is pilot
+numDataSym  = numSymRun - numPilotSym;
+
+% Modulation (QPSK)
+M  = 4;
+k0 = log2(M); 
+
+% --- FIX 1: Better Pilot Generation ---
+% Using a random QPSK sequence for pilot spreads energy in time.
+% We use a specific seed so Tx and Rx generate the exact same pilot.
+prev_rng = rng;
+rng(42); 
+pilotSym = (randi([0 1], N, 1)*2 - 1) + 1i*(randi([0 1], N, 1)*2 - 1);
+pilotSym = pilotSym / sqrt(2);
+rng(prev_rng); % Restore main seed
+
+% Channel Setup: Fixed Fading (Static for the simulation)
+% Normalized so channel energy is 1
+h1 = (randn(1,L) + 1i*randn(1,L)); 
+h1 = h1 / norm(h1); 
+h2 = (randn(1,L) + 1i*randn(1,L)); 
+h2 = h2 / norm(h2);
+
+BER = zeros(size(EbNo_dB));
+
+%% 2. Main Simulation Loop
+fprintf('Starting Simulation (Uncoded Verification)...\n');
+
+for e = 1:length(EbNo_dB)
+    totalErr  = 0;
+    totalBits = 0;
+    
+    EbNoLin = 10^(EbNo_dB(e)/10);
+    
+    % --- FIX 2: Set Code Rate to 1 (Coding Disabled) ---
+    codeRate = 1; 
+    
+    for run = 1:numRuns
+        %% --- TRANSMITTER ---
+        
+        % 1. Data Bit Generation
+        % Ensure total bits is exactly divisible by k0 (Modulation Order)
+        totalDataSyms = N * numDataSym;
+        nRawBits = totalDataSyms * k0; 
+        
+        txDataBits = randi([0 1], nRawBits, 1);
+        
+        % 2. Channel Coding (DISABLED FOR DEBUGGING)
+        % txCodedBits = encode74(txDataBits);
+        txCodedBits = txDataBits; % Pass raw bits through
+        
+        % 3. Symbol Mapping
+        dataSyms = qam_gray_mod(txCodedBits, M);
+        
+        % 4. Frame Assembly
+        X = zeros(N, numSymRun);
+        X(:,1) = pilotSym; % Symbol 1 is Pilot
+        
+        % Fill remainder with data
+        dataGrid = reshape(dataSyms, N, []);
+        colsFilled = size(dataGrid, 2);
+        X(:, 2:1+colsFilled) = dataGrid;
+        
+        % 5. IFFT & CP Addition
+        x_time = ifft(X, N, 1);
+        x_cp   = [x_time(end-cp_len+1:end, :); x_time];
+        tx_serial = x_cp(:);
+        
+        %% --- CHANNEL (SIMO 1x2) ---
+        
+        % Calculate Noise Power
+        % Bandwidth expansion factor: N / (N + cp_len)
+        SNRlin = EbNoLin * k0 * codeRate * (N / (N + cp_len));
+        
+        sigPower = mean(abs(tx_serial).^2);
+        noisePower = sigPower / SNRlin;
+        
+        % Apply Multipath Fading (Filter)
+        rx1_serial_clean = filter(h1, 1, tx_serial);
+        rx2_serial_clean = filter(h2, 1, tx_serial);
+        
+        % Add AWGN
+        noiseScale = sqrt(noisePower/2);
+        n1 = noiseScale * (randn(size(rx1_serial_clean)) + 1i*randn(size(rx1_serial_clean)));
+        n2 = noiseScale * (randn(size(rx2_serial_clean)) + 1i*randn(size(rx2_serial_clean)));
+        
+        rx1_serial = rx1_serial_clean + n1;
+        rx2_serial = rx2_serial_clean + n2;
+        
+        %% --- RECEIVER ---
+        
+        % 1. Parallelization & CP Removal
+        rx1_mat = reshape(rx1_serial, N+cp_len, numSymRun);
+        rx2_mat = reshape(rx2_serial, N+cp_len, numSymRun);
+        
+        rx1_no_cp = rx1_mat(cp_len+1:end, :);
+        rx2_no_cp = rx2_mat(cp_len+1:end, :);
+        
+        % 2. FFT
+        Y1 = fft(rx1_no_cp, N, 1);
+        Y2 = fft(rx2_no_cp, N, 1);
+        
+        % 3. Channel Estimation (Using Pilot at Symbol 1)
+        % Note: H_est calculation is valid because X(:,1) is known pilot
+        H1_est = Y1(:,1) ./ X(:,1);
+        H2_est = Y2(:,1) ./ X(:,1);
+        
+        % Replicate estimate for all data symbols (Static Channel assumption)
+        H1_grid = repmat(H1_est, 1, colsFilled);
+        H2_grid = repmat(H2_est, 1, colsFilled);
+        
+        % 4. MRC Combining
+        Y1_data = Y1(:, 2:1+colsFilled);
+        Y2_data = Y2(:, 2:1+colsFilled);
+        
+        numerator = conj(H1_grid).*Y1_data + conj(H2_grid).*Y2_data;
+        denominator = abs(H1_grid).^2 + abs(H2_grid).^2;
+        
+        % Avoid division by zero
+        denominator(denominator < 1e-10) = 1e-10; 
+        
+        Y_equalized = numerator ./ denominator;
+        
+        % 5. Demapping
+        rxCodedBits = qam_gray_demod(Y_equalized(:), M);
+        
+        % 6. Channel Decoding (DISABLED FOR DEBUGGING)
+        % rxDecodedBits = decode74(rxCodedBits);
+        rxDecodedBits = rxCodedBits; % Treat demod bits as final
+        
+        % 7. BER Calculation
+        % Ensure we compare exactly the same number of bits
+        len = min(length(txDataBits), length(rxDecodedBits));
+        bitErrors = sum(txDataBits(1:len) ~= rxDecodedBits(1:len));
+        
+        totalErr  = totalErr + bitErrors;
+        totalBits = totalBits + len;
+    end
+    
+    BER(e) = totalErr / totalBits;
+    fprintf('Eb/N0 = %2d dB | BER = %.5e\n', EbNo_dB(e), BER(e));
+    
+    % --- DEBUG: Visual Check on Last Loop ---
+    if e == length(EbNo_dB) && run == 1
+        H1_true_freq = fft(h1, N).';
+        figure;
+        subplot(2,1,1);
+        plot(abs(H1_true_freq), 'b', 'LineWidth', 2); hold on;
+        plot(abs(H1_est), 'r--', 'LineWidth', 2);
+        title('Channel Est Magnitude (Rx 1)'); legend('True','Est'); grid on;
+        subplot(2,1,2);
+        plot(angle(H1_true_freq), 'b', 'LineWidth', 2); hold on;
+        plot(angle(H1_est), 'r--', 'LineWidth', 2);
+        title('Channel Est Phase (Rx 1)'); grid on;
+    end
+end
+
+%% 3. Visualization
+save('results_simo_1x2_qpsk_debug.mat', 'EbNo_dB', 'BER');
+figure;
+semilogy(EbNo_dB, BER, '-bo', 'LineWidth', 2, 'MarkerFaceColor', 'b');
+grid on;
+title('OFDM SIMO 1x2 (Uncoded Verification)');
+xlabel('Eb/N0 (dB)');
+ylabel('Bit Error Rate (BER)');
+legend('SIMO 1x2 (Uncoded)');
+ylim([1e-6 1]);
+
+%% -------------------- Local Helper Functions --------------------
+function syms = qam_gray_mod(bits, M)
+    k = log2(M);
+    m = round(sqrt(M));
+    bps  = k/2;
+    bits = bits(:);
+    
+    % Pad if necessary (though our main loop prevents this)
+    remBits = mod(length(bits), k);
+    if remBits > 0
+        bits = [bits; zeros(k-remBits, 1)];
+    end
+    
+    B = reshape(bits, k, []).';     
+    bI = B(:,1:bps);
+    bQ = B(:,bps+1:end);
+    gI = bi2int(bI);
+    gQ = bi2int(bQ);
+    iI = gray2bin_int(gI);
+    iQ = gray2bin_int(gQ);
+    aI = 2*iI - (m-1);
+    aQ = 2*iQ - (m-1);
+    normFactor = sqrt(2*(m^2-1)/3);
+    syms = (aI + 1i*aQ) / normFactor;
+end
+
+function bits = qam_gray_demod(syms, M)
+    k = log2(M);
+    m = round(sqrt(M));
+    bps = k/2;
+    normFactor = sqrt(2*(m^2-1)/3);
+    syms = syms * normFactor;
+    I = real(syms);
+    Q = imag(syms);
+    levels = (-(m-1):2:(m-1));
+    idxI = slicer_to_index(I, levels);  
+    idxQ = slicer_to_index(Q, levels);
+    gI = bin2gray_int(idxI);
+    gQ = bin2gray_int(idxQ);
+    bI = int2bits(gI, bps);
+    bQ = int2bits(gQ, bps);
+    bitsMat = [bI bQ];
+    bits = reshape(bitsMat.', [], 1);
+end
+
+function idx = slicer_to_index(x, levels)
+    idx = zeros(size(x));
+    for n = 1:numel(x)
+        [~, ii] = min(abs(x(n) - levels));
+        idx(n) = ii - 1; 
+    end
+end
+
+function v = bi2int(B)
+    b = size(B,2);
+    w = 2.^(b-1:-1:0);
+    v = B * w.';
+end
+
+function B = int2bits(v, b)
+    v = v(:);
+    n = numel(v);
+    B = zeros(n,b);
+    for i = 1:b
+        B(:,i) = bitget(v, b - i + 1);
+    end
+end
+
+function b = gray2bin_int(g)
+    g = uint32(g);
+    b = g;
+    while any(g)
+        g = bitshift(g, -1);
+        b = bitxor(b, g);
+    end
+    b = double(b);
+end
+
+function g = bin2gray_int(b)
+    b = uint32(b);
+    g = bitxor(b, bitshift(b, -1));
+    g = double(g);
+end 

@@ -1,17 +1,15 @@
-%% OFDM Project - Phase 5B: SIMO 1x2 Fixed Fading + Pilot Estimation + MRC
+%% OFDM Project - Phase 5B: Final Corrected Code (SIMO 1x2 + Hamming + MRC)
 % 1 Tx -> 2 Rx antennas (SIMO)
-% Channel: Fixed multipath fading (L taps) + AWGN
-% Coding: Hamming (7,4) (External functions)
-% Pilots: 1st OFDM symbol is all pilots
-% Combining: MRC in frequency domain
-
+% Coding: Hamming (7,4) (Included as local functions)
+% Channel: Fixed multipath fading + AWGN
+% Equalization: MRC
 clear; clc; close all;
-rng(1); % Set seed for reproducibility
 
 %% 1. Parameters
+rng(1); % Set global seed
 N           = 1024;      % FFT size
 L           = 50;        % Channel taps
-cp_len      = 72;        % CP length (must be > L)
+cp_len      = 72;        % CP length
 EbNo_dB     = 0:2:30;    % Eb/N0 sweep range
 numRuns     = 200;       % Iterations per SNR
 numSymRun   = 50;        % OFDM symbols per frame
@@ -22,43 +20,53 @@ numDataSym  = numSymRun - numPilotSym;
 M  = 4;
 k0 = log2(M); 
 
-% Pilot Symbol (Known to Rx)
-pilotSym = (1+1i)/sqrt(2) * ones(N, 1); % All subcarriers pilot
+% Coding Rate (Hamming 7,4)
+codeRate = 4/7;
 
-% Channel Setup: Fixed Fading (Static for the simulation)
-% Normalized so average power is 1
-h1 = (randn(1,L) + 1i*randn(1,L)); 
-h1 = h1 / norm(h1); 
-h2 = (randn(1,L) + 1i*randn(1,L)); 
-h2 = h2 / norm(h2);
+% --- FIX: Better Pilot Generation ---
+% Generate a random QPSK pilot sequence (fixed seed for consistency)
+prev_rng = rng;
+rng(42); 
+pilotSym = (randi([0 1], N, 1)*2 - 1) + 1i*(randi([0 1], N, 1)*2 - 1);
+pilotSym = pilotSym / sqrt(2);
+rng(prev_rng);
+
+% Channel Setup: Fixed Fading
+h1 = (randn(1,L) + 1i*randn(1,L)); h1 = h1 / norm(h1); 
+h2 = (randn(1,L) + 1i*randn(1,L)); h2 = h2 / norm(h2);
 
 BER = zeros(size(EbNo_dB));
 
 %% 2. Main Simulation Loop
-fprintf('Starting Simulation...\n');
+fprintf('Starting Final Simulation...\n');
+
 for e = 1:length(EbNo_dB)
     totalErr  = 0;
     totalBits = 0;
     
     EbNoLin = 10^(EbNo_dB(e)/10);
     
-    % coding rate for (7,4)
-    codeRate = 4/7; 
-    
     for run = 1:numRuns
         %% --- TRANSMITTER ---
         
-        % 1. Data Bit Generation
-        % Calculate exact bits needed to fill the data symbols
-        nCodedBitsAvailable = N * k0 * numDataSym;
+        % 1. Data Bit Generation (The "LCM" Fix)
+        % We need the total coded bits to be divisible by:
+        %  - 7 (for Hamming Encoder output)
+        %  - 2 (for QPSK Modulator input)
+        % LCM(7, 2) = 14.
         
-        % We need a multiple of 7 for the coded bits to fit the decoder
-        nCodedBitsNeeded = floor(nCodedBitsAvailable/7) * 7;
+        totalSubcarriers = N * numDataSym;
+        maxCodedBits = totalSubcarriers * k0;
         
-        nRawBits = nCodedBitsNeeded * codeRate; 
-        txDataBits = randi([0 1], numRawBits, 1);
+        % Round down to nearest multiple of 14
+        nCodedBits = floor(maxCodedBits / 14) * 14;
         
-        % 2. Channel Coding (Hamming 7,4) - EXTERNAL FUNCTION
+        % Calculate raw data bits needed to produce those coded bits
+        nDataBits = nCodedBits * codeRate;
+        
+        txDataBits = randi([0 1], nDataBits, 1);
+        
+        % 2. Channel Coding (Hamming 7,4)
         txCodedBits = encode74(txDataBits);
         
         % 3. Symbol Mapping
@@ -69,9 +77,10 @@ for e = 1:length(EbNo_dB)
         X(:,1) = pilotSym; % Symbol 1 is Pilot
         
         % Fill remainder with data
-        dataGrid = reshape(dataSyms, N, []);
-        colsFilled = size(dataGrid, 2);
-        X(:, 2:1+colsFilled) = dataGrid;
+        % Note: There might be a few unused subcarriers at the very end
+        % because of the rounding to 14. We fill them with zeros (padding).
+        dataGridVector = [dataSyms; zeros(maxCodedBits/k0 - length(dataSyms), 1)];
+        X(:, 2:end) = reshape(dataGridVector, N, numDataSym);
         
         % 5. IFFT & CP Addition
         x_time = ifft(X, N, 1);
@@ -81,67 +90,59 @@ for e = 1:length(EbNo_dB)
         %% --- CHANNEL (SIMO 1x2) ---
         
         % Calculate Noise Power
-        % MUST account for Code Rate (4/7)
         SNRlin = EbNoLin * k0 * codeRate * (N / (N + cp_len));
-        
         sigPower = mean(abs(tx_serial).^2);
         noisePower = sigPower / SNRlin;
         
-        % Apply Multipath Fading (Filter)
-        rx1_serial_clean = filter(h1, 1, tx_serial);
-        rx2_serial_clean = filter(h2, 1, tx_serial);
+        % Apply Fading
+        rx1_clean = filter(h1, 1, tx_serial);
+        rx2_clean = filter(h2, 1, tx_serial);
         
         % Add AWGN
-        noiseScale = sqrt(noisePower/2);
-        n1 = noiseScale * (randn(size(rx1_serial_clean)) + 1i*randn(size(rx1_serial_clean)));
-        n2 = noiseScale * (randn(size(rx2_serial_clean)) + 1i*randn(size(rx2_serial_clean)));
-        
-        rx1_serial = rx1_serial_clean + n1;
-        rx2_serial = rx2_serial_clean + n2;
+        scale = sqrt(noisePower/2);
+        rx1 = rx1_clean + scale * (randn(size(rx1_clean)) + 1i*randn(size(rx1_clean)));
+        rx2 = rx2_clean + scale * (randn(size(rx2_clean)) + 1i*randn(size(rx2_clean)));
         
         %% --- RECEIVER ---
         
-        % 1. Parallelization & CP Removal
-        rx1_mat = reshape(rx1_serial, N+cp_len, numSymRun);
-        rx2_mat = reshape(rx2_serial, N+cp_len, numSymRun);
+        % 1. CP Removal & FFT
+        rx1_mat = reshape(rx1, N+cp_len, numSymRun);
+        rx2_mat = reshape(rx2, N+cp_len, numSymRun);
         
-        rx1_no_cp = rx1_mat(cp_len+1:end, :);
-        rx2_no_cp = rx2_mat(cp_len+1:end, :);
+        Y1 = fft(rx1_mat(cp_len+1:end, :), N, 1);
+        Y2 = fft(rx2_mat(cp_len+1:end, :), N, 1);
         
-        % 2. FFT
-        Y1 = fft(rx1_no_cp, N, 1);
-        Y2 = fft(rx2_no_cp, N, 1);
-        
-        % 3. Channel Estimation (Using Pilot at Symbol 1)
+        % 2. Channel Estimation
         H1_est = Y1(:,1) ./ X(:,1);
         H2_est = Y2(:,1) ./ X(:,1);
         
-        % Replicate estimate for all data symbols
-        H1_grid = repmat(H1_est, 1, colsFilled);
-        H2_grid = repmat(H2_est, 1, colsFilled);
+        H1_grid = repmat(H1_est, 1, numDataSym);
+        H2_grid = repmat(H2_est, 1, numDataSym);
         
-        % 4. MRC Combining
-        Y1_data = Y1(:, 2:1+colsFilled);
-        Y2_data = Y2(:, 2:1+colsFilled);
+        % 3. MRC Combining
+        Y1_data = Y1(:, 2:end);
+        Y2_data = Y2(:, 2:end);
         
-        numerator = conj(H1_grid).*Y1_data + conj(H2_grid).*Y2_data;
-        denominator = abs(H1_grid).^2 + abs(H2_grid).^2;
-        denominator(denominator < 1e-10) = 1e-10; % Safety
+        numer = conj(H1_grid).*Y1_data + conj(H2_grid).*Y2_data;
+        denom = abs(H1_grid).^2 + abs(H2_grid).^2 + 1e-10;
         
-        Y_equalized = numerator ./ denominator;
+        Y_eq = numer ./ denom;
         
-        % 5. Demapping
-        rxCodedBits = qam_gray_demod(Y_equalized(:), M);
+        % 4. Demapping
+        % Extract valid symbols (ignore the zero-padding at the end)
+        numValidSyms = length(dataSyms);
+        Y_vec = Y_eq(:);
+        Y_valid = Y_vec(1:numValidSyms);
         
-        % 6. Channel Decoding (Hamming 7,4) - EXTERNAL FUNCTION
+        rxCodedBits = qam_gray_demod(Y_valid, M);
+        
+        % 5. Channel Decoding
         rxDecodedBits = decode74(rxCodedBits);
         
-        % 7. BER Calculation
-        len = min(length(txDataBits), length(rxDecodedBits));
-        bitErrors = sum(txDataBits(1:len) ~= rxDecodedBits(1:len));
-        
+        % 6. BER Calc
+        bitErrors = sum(txDataBits ~= rxDecodedBits);
         totalErr  = totalErr + bitErrors;
-        totalBits = totalBits + len;
+        totalBits = totalBits + length(txDataBits);
     end
     
     BER(e) = totalErr / totalBits;
@@ -149,88 +150,108 @@ for e = 1:length(EbNo_dB)
 end
 
 %% 3. Visualization
+save('results_simo_final.mat', 'EbNo_dB', 'BER');
 figure;
 semilogy(EbNo_dB, BER, '-bo', 'LineWidth', 2, 'MarkerFaceColor', 'b');
 grid on;
-title('OFDM SIMO 1x2 with Fixed Fading & MRC');
+title('OFDM SIMO 1x2 with Fixed Fading & Hamming(7,4)');
 xlabel('Eb/N0 (dB)');
-ylabel('Bit Error Rate (BER)');
-legend('SIMO 1x2 (Estimated Channel)');
-ylim([1e-5 1]);
+ylabel('BER');
+ylim([1e-6 1]);
 
 %% -------------------- Local Helper Functions --------------------
+
+% --- QPSK MOD/DEMOD ---
 function syms = qam_gray_mod(bits, M)
-    k = log2(M);
-    m = round(sqrt(M));
-    bps  = k/2;
-    bits = bits(:);
-    B = reshape(bits, k, []).';     
-    bI = B(:,1:bps);
-    bQ = B(:,bps+1:end);
-    gI = bi2int(bI);
-    gQ = bi2int(bQ);
-    iI = gray2bin_int(gI);
-    iQ = gray2bin_int(gQ);
-    aI = 2*iI - (m-1);
-    aQ = 2*iQ - (m-1);
-    normFactor = sqrt(2*(m^2-1)/3);
-    syms = (aI + 1i*aQ) / normFactor;
+    k = log2(M); 
+    x = reshape(bits, k, []).';
+    dec = x * [2; 1]; % Binary to integer (for k=2)
+    % Gray Map for QPSK: 0->0, 1->1, 3->2, 2->3 (standard QPSK gray)
+    % Map: 00-> -1-1i, 01-> -1+1i, 11-> 1+1i, 10-> 1-1i
+    map = [(-1-1i) (-1+1i) (1-1i) (1+1i)]/sqrt(2); 
+    syms = map(dec+1).';
 end
 
 function bits = qam_gray_demod(syms, M)
+    % Hard decision demodulation for QPSK
+    % Constellation: 1st quadrant (1+1i)->11(3), 2nd (-1+1i)->01(1)
+    % 3rd (-1-1i)->00(0), 4th (1-1i)->10(2)
     k = log2(M);
-    m = round(sqrt(M));
-    bps = k/2;
-    normFactor = sqrt(2*(m^2-1)/3);
-    syms = syms * normFactor;
-    I = real(syms);
-    Q = imag(syms);
-    levels = (-(m-1):2:(m-1));
-    idxI = slicer_to_index(I, levels);  
-    idxQ = slicer_to_index(Q, levels);
-    gI = bin2gray_int(idxI);
-    gQ = bin2gray_int(idxQ);
-    bI = int2bits(gI, bps);
-    bQ = int2bits(gQ, bps);
-    bitsMat = [bI bQ];
-    bits = reshape(bitsMat.', [], 1);
+    bits = zeros(length(syms)*k, 1);
+    
+    I = real(syms); Q = imag(syms);
+    
+    % Decision thresholds are at 0
+    b0 = (I > 0); % MSB
+    b1 = (Q > 0); % LSB
+    
+    % Interleave bits
+    bits(1:2:end) = b0;
+    bits(2:2:end) = b1;
 end
 
-function idx = slicer_to_index(x, levels)
-    idx = zeros(size(x));
-    for n = 1:numel(x)
-        [~, ii] = min(abs(x(n) - levels));
-        idx(n) = ii - 1; 
+% --- HAMMING (7,4) ENCODER ---
+function coded = encode74(msg)
+    % Standard G matrix for Hamming (7,4)
+    % Structure: [P I] where P is 4x3 parity, I is 4x4 identity
+    G = [1 1 0 1 0 0 0;
+         0 1 1 0 1 0 0;
+         1 1 1 0 0 1 0;
+         1 0 1 0 0 0 1];
+     
+    n = 7; k = 4;
+    numBlks = length(msg) / k;
+    msgMat = reshape(msg, k, numBlks).'; % numBlks x 4
+    
+    % Modulo-2 matrix multiplication
+    codedMat = mod(msgMat * G, 2);
+    
+    coded = reshape(codedMat.', [], 1);
+end
+
+% --- HAMMING (7,4) DECODER ---
+function decoded = decode74(coded)
+    % Parity Check Matrix H
+    H = [1 0 0 1 0 1 1;
+         0 1 0 1 1 1 0;
+         0 0 1 0 1 1 1];
+    
+    n = 7; k = 4;
+    numBlks = length(coded) / n;
+    rxMat = reshape(coded, n, numBlks).'; % numBlks x 7
+    
+    % Calculate Syndrome: S = R * H'
+    syndrome = mod(rxMat * H.', 2);
+    
+    % Convert syndrome binary vector to decimal index
+    synDec = syndrome * [4; 2; 1]; 
+    
+    % Error correction logic (Syndrome points to error column in H)
+    % Map syndrome value to column index in H to flip
+    % H columns: [100, 010, 001, 110, 011, 111, 101] (Decimal: 4, 2, 1, 6, 3, 7, 5)
+    % Map: Syn 4->Bit1, Syn 2->Bit2, Syn 1->Bit3 ...
+    
+    % We process row by row
+    decodedMat = zeros(numBlks, k);
+    
+    % Indices of data bits in the codeword (based on G above): 4,5,6,7
+    dataIdx = [4 5 6 7];
+    
+    for i = 1:numBlks
+        s = synDec(i);
+        r_row = rxMat(i,:);
+        
+        if s ~= 0
+            % Find which bit corresponds to this syndrome
+            % Based on H structure above:
+            % S=1(001)->Bit3, S=2(010)->Bit2, S=3(011)->Bit5
+            % S=4(100)->Bit1, S=5(101)->Bit7, S=6(110)->Bit4, S=7(111)->Bit6
+            flipMap = [3 2 5 1 7 4 6]; 
+            errBit = flipMap(s);
+            r_row(errBit) = ~r_row(errBit); % Correct error
+        end
+        decodedMat(i,:) = r_row(dataIdx);
     end
-end
-
-function v = bi2int(B)
-    b = size(B,2);
-    w = 2.^(b-1:-1:0);
-    v = B * w.';
-end
-
-function B = int2bits(v, b)
-    v = v(:);
-    n = numel(v);
-    B = zeros(n,b);
-    for i = 1:b
-        B(:,i) = bitget(v, b - i + 1);
-    end
-end
-
-function b = gray2bin_int(g)
-    g = uint32(g);
-    b = g;
-    while any(g)
-        g = bitshift(g, -1);
-        b = bitxor(b, g);
-    end
-    b = double(b);
-end
-
-function g = bin2gray_int(b)
-    b = uint32(b);
-    g = bitxor(b, bitshift(b, -1));
-    g = double(g);
+    
+    decoded = reshape(decodedMat.', [], 1);
 end
