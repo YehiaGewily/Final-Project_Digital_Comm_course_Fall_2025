@@ -25,5 +25,5 @@ function decodedBits = decode74(rxCodedBits)
     
     % Extract only the first 4 data bits
     dataBlocks = correctedBlocks(:, 1:4);
-    decodedBits = dataBlocks(:);
+    decodedBits = reshape(dataBlocks.', [], 1);
 end

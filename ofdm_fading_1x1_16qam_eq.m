@@ -3,7 +3,6 @@
 % Pilot scheme: 1st OFDM symbol is all pilots (known), rest are data
 % Channel estimation: Hest = Ypilot ./ Xpilot
 % Equalization: Yeq = Ydata ./ Hest
-% Expected: BER improves significantly vs. "no EQ" fading case.
 
 clear; clc; close all;
 rng(1);
@@ -23,64 +22,66 @@ M  = 16;
 k0 = log2(M);
 
 % Pilot (known)
-pilotSym = (1+1i)/sqrt(2);  % unit-energy
-
-% Fixed deterministic channel realization
-% Normalized to unit power
-h = (randn(1,L) + 1i*randn(1,L));
-h = h / norm(h);
+pilotSequence = (randn(N,1) + 1i*randn(N,1)) / sqrt(2);  % Random pilot with unit energy
 
 BER = zeros(size(EbNo_dB));
+codeRate = 4/7;
 
-%% Main simulation
-for e = 1:length(EbNo_dB)
+%% Main simulation - PARALLELIZED
+tic;
+parfor e = 1:length(EbNo_dB)
     EbNoLin = 10^(EbNo_dB(e)/10);
-    totalErr = 0; totalBits = 0;
+    totalErr = 0; 
+    totalBits = 0;
     
-    % Code Rate
-    codeRate = 4/7;
-
     for run = 1:numRuns
+        % Generate random channel per run for proper fading simulation
+        h = (randn(1,L) + 1i*randn(1,L));
+        h = h / norm(h);
+
         %% ---------- TRANSMITTER ----------
         X = zeros(N, numSymRun);
-        X(:,1) = pilotSym;  % Insert pilot symbol in the first column
+        X(:,1) = pilotSequence;  % Insert pilot sequence
         
-        % 1. Calculate how many RAW bits we need (4/7ths of the coded capacity)
-        nCodedBitsAvailable = N * k0 * numDataSym;
+        % 1. Calculate Capacity
+        % Total available data subcarriers in the frame
+        totalSubcarriers = N * numDataSym;
+        nCodedBitsAvailable = totalSubcarriers * k0;
         
-        % Ensure multiple of 7 for Hamming
-        nCodedBitsNeeded = floor(nCodedBitsAvailable/7) * 7;
+        % 2. Bit Alignment
+        % Must be multiple of 28 (LCM of 7 for Hamming and 4 for 16-QAM)
+        nCodedBits = floor(nCodedBitsAvailable/28) * 28;
+        nDataBits  = nCodedBits * codeRate;
         
-        % Calculate raw bits
-        numRawBits = nCodedBitsNeeded * codeRate;
+        txDataBits = randi([0 1], nDataBits, 1);
         
-        txDataBits = randi([0 1], numRawBits, 1);
+        % 3. Encode
+        txCodedBits = encode74(txDataBits);
         
-        % 2. ENCODE the bits using (7,4) Linear Block Code
-        txCodedBits = encode74(txDataBits); 
+        % 4. Modulate
+        dataSyms = qam_gray_mod(txCodedBits, M);
         
-        % 3. Map bits to symbols and pack the grid
-        dataSyms = qam_gray_mod(txCodedBits, M);               
+        % 5. Frame Assembly (with Padding)
+        % We have 'length(dataSyms)' symbols, but grid has 'totalSubcarriers' spots.
+        % Pad the rest with zeros (or random noise) to fill the grid.
+        numValidSyms = length(dataSyms);
+        padding = zeros(totalSubcarriers - numValidSyms, 1);
         
-        % Reshape carefully
-        dataGrid = reshape(dataSyms, N, []);
-        colsFilled = size(dataGrid, 2);
-        X(:, 2:1+colsFilled) = dataGrid;
+        fullGridVec = [dataSyms; padding];
+        X(:, 2:end) = reshape(fullGridVec, N, numDataSym);
         
-        % 4. OFDM Modulation (IFFT) and Cyclic Prefix
+        % 6. OFDM Modulation
         x_time = ifft(X, N, 1);
         x_cp = [x_time(end-cp_len+1:end, :); x_time];
         tx_serial = x_cp(:);
         
         %% ---------- CHANNEL SIMULATION ----------
-        % Calculate Noise and Apply Fading
-        % MUST account for Code Rate (4/7)
+        % Calculate Noise
+        Ps_tx = 1; % Normalized transmit power
         SNRlin = EbNoLin * k0 * codeRate * (N / (N + cp_len));
+        sigma2 = Ps_tx / SNRlin;
         
-        Ps = mean(abs(tx_serial).^2);
-        sigma2 = Ps / SNRlin;
-        
-        % Apply Fading using FILTER (Corrects timing vs. conv)
+        % Apply Fading
         rx_serial_clean = filter(h, 1, tx_serial);
         
         % Add AWGN
@@ -93,43 +94,51 @@ for e = 1:length(EbNo_dB)
         rx_no_cp = rx_parallel(cp_len+1:end, :);       
         Yf = fft(rx_no_cp, N, 1);                          
         
-        % 2. Channel Estimation and Equalization 
-        Hest = Yf(:,1) ./ X(:,1);
+        % 2. Channel Estimation
+        % Use the known pilot sequence to estimate H
+        H_est = Yf(:,1) ./ X(:,1);
         
         % Replicate for all data columns
-        H_grid = repmat(Hest, 1, colsFilled);
+        H_grid = repmat(H_est, 1, numDataSym);
         
         % Regularize
         H_grid(abs(H_grid) < 1e-12) = 1e-12;                   
         
-        % Equalize
-        Y_data = Yf(:, 2:1+colsFilled);
-        Yeq = Y_data ./ H_grid;                         
+        % 3. Equalization (Zero-Forcing)
+        Y_data = Yf(:, 2:end);
+        Yeq = Y_data ./ H_grid;
         
-        % 3. Demapping (Symbol -> Coded Bits)
-        rxSyms = Yeq(:);
-        rxCodedBits = qam_gray_demod(rxSyms, M);
+        % 4. Extract Valid Symbols (Discard Padding)
+        Yeq_vec = Yeq(:);
+        Y_valid = Yeq_vec(1:numValidSyms);
         
-        % 4. DECODE the bits back to raw data 
+        % 5. Demap & Decode
+        rxCodedBits = qam_gray_demod(Y_valid, M);
         rxDecodedBits = decode74(rxCodedBits); 
         
-        %% ---------- BIT ERROR RATE (BER) ----------
-        % Compare decoded bits to original raw bits
-        nCompare = min(length(txDataBits), length(rxDecodedBits));
-        err = sum(txDataBits(1:nCompare) ~= rxDecodedBits(1:nCompare));
+        %% ---------- BER CALCULATION ----------
+        % Lengths should now match exactly
+        err = sum(txDataBits ~= rxDecodedBits);
         
         totalErr = totalErr + err; 
-        totalBits = totalBits + nCompare;
+        totalBits = totalBits + length(txDataBits);
     end
+    
     BER(e) = totalErr / totalBits;
     fprintf('Eb/N0 = %2d dB, BER = %.3e\n', EbNo_dB(e), BER(e));
 end
+elapsed = toc;
+
+%% Print results
+fprintf('\n========== SIMULATION COMPLETE ==========\n');
+fprintf('Total Time: %.2f seconds\n\n', elapsed);
 
 %% Plot
 figure; semilogy(EbNo_dB, BER, 'r-o', 'LineWidth', 1.5); grid on;
 xlabel('E_b/N_0 (dB)'); ylabel('BER');
 title('16-QAM OFDM SISO: Fixed Multipath + AWGN (Pilot Hest + ZF EQ)');
 legend('1x1 fading + 16-QAM EQ');
+ylim([1e-5 1]);
 
 %% -------------------- Helper Functions --------------------
 function syms = qam_gray_mod(bits, M)
@@ -184,11 +193,11 @@ function bits = qam_gray_demod(syms, M)
 end
 
 function idx = slicer_to_index(x, levels)
-    idx = zeros(size(x));
-    for n = 1:numel(x)
-        [~, ii] = min(abs(x(n) - levels));
-        idx(n) = ii - 1; % 0-based
-    end
+    % OPTIMIZED: vectorized slicing with proper broadcasting
+    x = x(:);  % Ensure column vector
+    levels = levels(:).';  % Ensure row vector
+    [~, idx] = min(abs(x - levels), [], 2);  % Find nearest level per symbol
+    idx = idx - 1;  % 0-based indexing (0 to m-1)
 end
 
 function v = bi2int(B)

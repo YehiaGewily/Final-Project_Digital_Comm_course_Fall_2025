@@ -12,5 +12,7 @@ function txCodedBits = encode74(txDataBits)
     % Reshape to Nx4 and multiply mod 2
     bitBlocks = reshape(txDataBits, 4, []).'; 
     codedBlocks = mod(bitBlocks * G, 2); 
-    txCodedBits = codedBlocks(:); 
+    
+    % Transpose codedBlocks before linearizing so bits of a codeword remain contiguous
+    txCodedBits = reshape(codedBlocks.', [], 1); 
 end
